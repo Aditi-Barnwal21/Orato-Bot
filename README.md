@@ -1,6 +1,8 @@
-# Public Speaking Simulator
+# Public Speaking Simulator & AI Mock Interview
 
-A comprehensive web application that helps users practice and improve their public speaking skills through real-time AI-powered analysis of facial expressions, voice patterns, and speech sentiment.
+**Live Site:** [Orato Bot](https://orato-bot.onrender.com)
+
+A comprehensive web application that helps users practice and improve their public speaking skills through real-time AI-powered analysis of facial expressions, voice patterns, and speech sentiment, alongside a fully interactive AI Mock Interview system.
 
 ## 🎯 Features
 
@@ -183,9 +185,9 @@ npm run build
 ```
 
 ### Deployment Options
-- **Static Hosting**: Deploy to Netlify, Vercel, or GitHub Pages
-- **Web Server**: Serve build folder with any web server
-- **CDN**: Upload to AWS S3 + CloudFront
+- **Render (Recommended)**: Serve the Express backend and React frontend as a unified Web Service.
+- **Static Hosting**: Deploy the React build to Vercel or Netlify (requires separating the Express backend).
+- **Web Server**: Serve build folder with any web server or VPS.
 
 ## 🔄 Future Enhancements
 
