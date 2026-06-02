@@ -16,7 +16,8 @@ const Simulator = ({ onEndSimulation }) => {
   const [speechText, setSpeechText] = useState('');
   const [isListening, setIsListening] = useState(false);
   const [hasSpeechRecognition, setHasSpeechRecognition] = useState(false);
-  
+  const [speechError, setSpeechError] = useState('');
+
   // New state for enhanced feedback
   const [facialEngagement, setFacialEngagement] = useState(null);
   const [toneAnalysis, setToneAnalysis] = useState(null);
@@ -26,7 +27,7 @@ const Simulator = ({ onEndSimulation }) => {
   const [currentVolume, setCurrentVolume] = useState(0);
   const [postureAnalysis, setPostureAnalysis] = useState(null);
   const [gestureAnalysis, setGestureAnalysis] = useState(null);
-  
+
   // Session data tracking
   const [sessionData, setSessionData] = useState({
     emotions: [],
@@ -49,13 +50,17 @@ const Simulator = ({ onEndSimulation }) => {
   const intervalRef = useRef(null);
   const audioStreamRef = useRef(null);
   const speechKeepAliveRef = useRef(null);
+  const cumulativeTranscriptRef = useRef('');
+  const cumulativeWordCountRef = useRef(0);
+  const isRecordingRef = useRef(false);
+  const sessionStartTimeRef = useRef(null);
 
   // Load face-api models and initialize analyzers
   useEffect(() => {
     const loadModels = async () => {
       try {
         const MODEL_URL = '/models';
-        
+
         // Load models from CDN if local models are not available
         await Promise.all([
           faceapi.nets.tinyFaceDetector.loadFromUri('https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights'),
@@ -63,10 +68,10 @@ const Simulator = ({ onEndSimulation }) => {
           faceapi.nets.faceRecognitionNet.loadFromUri('https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights'),
           faceapi.nets.faceExpressionNet.loadFromUri('https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights')
         ]);
-        
+
         // Initialize analyzers
         await sentimentAnalyzer.initialize();
-        
+
         setIsModelLoaded(true);
       } catch (error) {
         console.error('Error loading face-api models:', error);
@@ -91,7 +96,7 @@ const Simulator = ({ onEndSimulation }) => {
         existing.getTracks().forEach(t => t.stop());
         videoRef.current.srcObject = null;
       }
-    } catch {}
+    } catch { }
 
     // Helper to try constraints in order
     const tryGetUserMedia = async (constraintsList) => {
@@ -128,7 +133,7 @@ const Simulator = ({ onEndSimulation }) => {
       ].filter(Boolean);
 
       const stream = await tryGetUserMedia(constraintsOrder);
-      
+
       if (videoRef.current) {
         const video = videoRef.current;
         video.setAttribute('playsinline', 'true');
@@ -138,13 +143,13 @@ const Simulator = ({ onEndSimulation }) => {
           if (video.readyState >= 2) return resolve();
           video.onloadedmetadata = () => resolve();
         });
-        try { await video.play(); } catch {}
+        try { await video.play(); } catch { }
       }
 
       // Connect audio stream to sentiment analyzer for volume analysis
       audioStreamRef.current = stream;
       sentimentAnalyzer.connectAudioStream(stream);
-      
+
       return stream;
     } catch (error) {
       console.error('Error accessing camera:', error);
@@ -195,42 +200,33 @@ const Simulator = ({ onEndSimulation }) => {
       const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
       const recognition = new SpeechRecognition();
       recognitionRef.current = recognition;
-      
+
       recognition.continuous = true;
       recognition.interimResults = true;
       recognition.lang = 'en-US';
       recognition.maxAlternatives = 1;
-      // Improve accuracy settings
-      if (recognition.serviceURI) {
-        recognition.serviceURI = 'wss://www.google.com/speech-api/full-duplex/v1/up';
-      }
       setHasSpeechRecognition(true);
-      
+
       let lastRestartAt = 0;
       recognition.onresult = (event) => {
         // If we get results, we definitely are listening
         if (!isListening) setIsListening(true);
         let finalTranscript = '';
         let interimTranscript = '';
-        
+
         for (let i = event.resultIndex; i < event.results.length; i++) {
           const result = event.results[i];
           const transcript = result[0].transcript;
-          const confidence = result[0].confidence || 0.8; // Default confidence if not provided
-          
-          // Only process results with reasonable confidence
-          if (confidence > 0.3) {
-            if (result.isFinal) {
-              finalTranscript += transcript;
-            } else {
-              interimTranscript += transcript;
-            }
+          if (result.isFinal) {
+            finalTranscript += transcript;
+          } else {
+            interimTranscript += transcript;
           }
         }
-        
-        const fullText = finalTranscript + interimTranscript;
+
+        const fullText = (cumulativeTranscriptRef.current ? cumulativeTranscriptRef.current + ' ' : '') + finalTranscript + interimTranscript;
         setSpeechText(fullText);
-        
+
         // Debug logging for speech recognition
         if (finalTranscript) {
           console.log('=== Speech Recognition Debug ===');
@@ -238,21 +234,22 @@ const Simulator = ({ onEndSimulation }) => {
           console.log('Interim transcript:', interimTranscript);
           console.log('Full text:', fullText);
         }
-        
+
         if (finalTranscript) {
           const timestamp = Date.now();
-          
+
           // Accumulate transcript for session recording
-          setCumulativeTranscript(prev => prev + ' ' + finalTranscript.trim());
-          
+          cumulativeTranscriptRef.current += (cumulativeTranscriptRef.current ? ' ' : '') + finalTranscript.trim();
+          setCumulativeTranscript(cumulativeTranscriptRef.current);
+
           // Analyze new speech features
           const volumeLevel = sentimentAnalyzer.getVolumeLevel();
           const frequencyData = sentimentAnalyzer.dataArray;
-          
+
           const toneResult = sentimentAnalyzer.detectTone(finalTranscript, volumeLevel, frequencyData);
           const volumeResult = sentimentAnalyzer.analyzeVolume(volumeLevel);
           const fillerResult = sentimentAnalyzer.detectFillersAndPauses(finalTranscript, timestamp);
-          
+
           // Debug logging for filler analysis
           console.log('=== Filler Analysis Debug ===');
           console.log('Filler result:', fillerResult);
@@ -260,19 +257,23 @@ const Simulator = ({ onEndSimulation }) => {
           console.log('Filler percentage:', fillerResult.fillerPercentage);
           console.log('Detected fillers:', fillerResult.fillerWords);
           console.log('===========================');
-          
-          // Calculate speaking pace
+
+          // Calculate speaking pace using rolling window based on finalized segments
+          const sessionStartTime = sessionStartTimeRef.current;
           const sessionTime = sessionStartTime ? timestamp - sessionStartTime : 1000;
-          const wordCount = finalTranscript.trim().split(/\s+/).length;
-          const paceResult = sentimentAnalyzer.analyzeSpeakingPace(wordCount, sessionTime);
-          
+          const newWords = finalTranscript.trim().split(/\s+/).filter(w => w.length > 0).length;
+          cumulativeWordCountRef.current += newWords;
+          const isFinalSegment = finalTranscript.length > 0;
+          const paceWords = isFinalSegment ? newWords : cumulativeWordCountRef.current;
+          const paceResult = sentimentAnalyzer.analyzeSpeakingPace(paceWords, sessionTime, isFinalSegment);
+
           // Update real-time feedback
           setToneAnalysis(toneResult);
           setVolumeAnalysis(volumeResult);
           setFillerAnalysis(fillerResult);
           setPaceAnalysis(paceResult);
           setCurrentVolume(volumeLevel);
-          
+
           // Store in session data
           setSessionData(prev => ({
             ...prev,
@@ -287,49 +288,46 @@ const Simulator = ({ onEndSimulation }) => {
           }));
         }
       };
-      
+
       recognition.onstart = () => {
         setIsListening(true);
+        setSpeechError('');
       };
 
       recognition.onaudiostart = () => {
-        if (!isListening) setIsListening(true);
+        setIsListening(true);
+        setSpeechError('');
       };
 
       recognition.onaudioend = () => {
-        if (isRecording && recognitionRef.current) {
-          try { recognitionRef.current.stop(); } catch {}
-        }
+        // Just let it naturally end and trigger onend
       };
 
       recognition.onend = () => {
         // Auto-restart while recording session is active
-        if (isRecording && recognitionRef.current) {
+        if (isRecordingRef.current && recognitionRef.current) {
           const now = Date.now();
           if (now - lastRestartAt > 500) {
             lastRestartAt = now;
-            try {
-              recognitionRef.current.abort && recognitionRef.current.abort();
-            } catch {}
-            try { recognitionRef.current.start(); } catch {}
+            try { recognitionRef.current.start(); } catch { }
           }
         } else {
           setIsListening(false);
         }
       };
-      
+
       recognition.onerror = (event) => {
         console.error('Speech recognition error:', event.error);
-        // Try to recover from intermittent errors
-        if (isRecording && recognitionRef.current && (event.error === 'no-speech' || event.error === 'network' || event.error === 'aborted')) {
-          const now = Date.now();
-          if (now - lastRestartAt > 500) {
-            lastRestartAt = now;
-            try { recognitionRef.current.start(); } catch {}
-          }
-        } else if (event.error === 'not-allowed' || event.error === 'audio-capture') {
-          alert('Microphone access is blocked. Click the mic icon in the address bar to Allow, then restart the session.');
+        if (event.error !== 'no-speech' && event.error !== 'aborted') {
+          setSpeechError(`Error: ${event.error}`);
         }
+
+        if (event.error === 'not-allowed' || event.error === 'audio-capture') {
+          setSpeechError('Microphone access is blocked in browser or OS.');
+        }
+
+        // We do NOT need to call start() here because onerror is always followed by onend
+        // according to the Web Speech API spec. onend will handle the restart.
       };
     }
   };
@@ -339,37 +337,37 @@ const Simulator = ({ onEndSimulation }) => {
     if (videoRef.current && canvasRef.current && isModelLoaded) {
       const video = videoRef.current;
       const canvas = canvasRef.current;
-      
+
       // Set canvas dimensions to match video
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
-      
+
       const ctx = canvas.getContext('2d');
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      
+
       try {
         const detections = await faceapi
           .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions())
           .withFaceLandmarks()
           .withFaceExpressions();
-        
+
         if (detections.length > 0) {
           const detection = detections[0];
           const timestamp = Date.now();
-          
+
           // Draw detections on canvas
           faceapi.draw.drawDetections(canvas, detections);
           faceapi.draw.drawFaceLandmarks(canvas, detections);
           faceapi.draw.drawFaceExpressions(canvas, detections);
-          
+
           // Get emotion with highest confidence
           const expressions = detection.expressions;
-          const maxExpression = Object.keys(expressions).reduce((a, b) => 
+          const maxExpression = Object.keys(expressions).reduce((a, b) =>
             expressions[a] > expressions[b] ? a : b
           );
-          
+
           setCurrentEmotion(maxExpression);
-          
+
           // Enhanced facial engagement analysis
           const engagementResult = facialAnalyzer.analyzeFacialEngagement(detection, timestamp);
           setFacialEngagement(engagementResult);
@@ -378,30 +376,30 @@ const Simulator = ({ onEndSimulation }) => {
           const gestures = engagementResult?.bodyLanguage?.gestures || null;
           setPostureAnalysis(posture);
           setGestureAnalysis(gestures);
-          
+
           // Calculate confidence score using multiple factors
           const expressionConfidence = expressions[maxExpression] * 100;
-          let calculatedConfidence = Math.min(100, Math.max(0, 
+          let calculatedConfidence = Math.min(100, Math.max(0,
             (expressions.happy + expressions.neutral) * 100 - expressions.sad * 50
           ));
-          
+
           // Enhance confidence calculation with sentiment analysis and engagement
           if (speechText.trim()) {
             const sentimentConfidence = sentimentAnalyzer.getSpeakingConfidence(speechText, expressions);
             calculatedConfidence = (calculatedConfidence + sentimentConfidence) / 2;
           }
-          
+
           // Factor in facial engagement score
           if (engagementResult && engagementResult.overallEngagement) {
             calculatedConfidence = (calculatedConfidence + engagementResult.overallEngagement.score) / 2;
           }
-          
+
           setConfidence(Math.round(calculatedConfidence));
-          
+
           // Use enhanced eye contact from facial analyzer
           const eyeContactScore = engagementResult?.eyeContact?.percentage || 50;
           setEyeContact(eyeContactScore);
-          
+
           // Store enhanced session data
           setSessionData(prev => ({
             ...prev,
@@ -430,33 +428,46 @@ const Simulator = ({ onEndSimulation }) => {
     }
     const stream = await startCamera();
     initSpeechRecognition();
-    
+
     // Reset analyzers for new session
     facialAnalyzer.resetSession();
     sentimentAnalyzer.resetSession();
-    
+
     // Initialize session
     setIsRecording(true);
-    setSessionStartTime(Date.now());
+    isRecordingRef.current = true;
+    setSpeechError('');
+    const now = Date.now();
+    setSessionStartTime(now);
+    sessionStartTimeRef.current = now;
     setCumulativeTranscript('');
+    cumulativeTranscriptRef.current = '';
+    cumulativeWordCountRef.current = 0;
     setTotalSpeakingTime(0);
-    setRecordStartMs(Date.now());
-    
+    setRecordStartMs(now);
+
     if (recognitionRef.current) {
-      try { recognitionRef.current.start(); setIsListening(true); } catch {}
+      try {
+        recognitionRef.current.start();
+        setIsListening(true);
+      } catch (e) {
+        console.error("Speech start error:", e);
+        setSpeechError(`Start error: ${e.message}`);
+      }
     }
-    
+
     // Start face detection interval
     intervalRef.current = setInterval(detectFaces, 1000);
 
     // Fallback: if not listening within 3s, try to restart once
     if (speechKeepAliveRef.current) clearTimeout(speechKeepAliveRef.current);
-    speechKeepAliveRef.current = setTimeout(() => {
-      if (isRecording && recognitionRef.current && !isListening) {
+    speechKeepAliveRef.current = setInterval(() => {
+      if (isRecordingRef.current && recognitionRef.current && !isListening) {
         try {
-          recognitionRef.current.abort && recognitionRef.current.abort();
-        } catch {}
-        try { recognitionRef.current.start(); setIsListening(true); } catch {}
+          recognitionRef.current.start();
+        } catch (e) {
+          // Ignore, it might just be starting
+        }
       }
     }, 3000);
   };
@@ -464,56 +475,57 @@ const Simulator = ({ onEndSimulation }) => {
   // Stop recording session
   const stopRecording = () => {
     setIsRecording(false);
+    isRecordingRef.current = false;
     setIsListening(false);
-    
+
     if (recognitionRef.current) {
       recognitionRef.current.stop();
     }
-    
+
     if (intervalRef.current) {
       clearInterval(intervalRef.current);
     }
     if (speechKeepAliveRef.current) {
-      clearTimeout(speechKeepAliveRef.current);
+      clearInterval(speechKeepAliveRef.current);
       speechKeepAliveRef.current = null;
     }
-    
+
     // Stop camera and audio
     if (videoRef.current && videoRef.current.srcObject) {
       const tracks = videoRef.current.srcObject.getTracks();
       tracks.forEach(track => track.stop());
     }
-    
-    
+
+
     // Calculate comprehensive session summary
-    const sessionDuration = sessionStartTime ? 
+    const sessionDuration = sessionStartTime ?
       Math.round((Date.now() - sessionStartTime) / 1000) : 0;
-    
+
     const avgConfidence = sessionData.confidenceScores.length > 0 ?
       Math.round(sessionData.confidenceScores.reduce((sum, item) => sum + item.score, 0) / sessionData.confidenceScores.length) : 0;
-    
+
     const avgEyeContact = sessionData.eyeContactScores.length > 0 ?
       Math.round(sessionData.eyeContactScores.reduce((sum, item) => sum + item.score, 0) / sessionData.eyeContactScores.length) : 0;
-    
+
     const dominantEmotion = sessionData.emotions.length > 0 ?
       sessionData.emotions.reduce((acc, curr) => {
         acc[curr.emotion] = (acc[curr.emotion] || 0) + 1;
         return acc;
       }, {}) : {};
-    
+
     const mostFrequentEmotion = Object.keys(dominantEmotion).length > 0 ?
       Object.keys(dominantEmotion).reduce((a, b) => dominantEmotion[a] > dominantEmotion[b] ? a : b) : 'neutral';
-    
+
     // Analyze comprehensive speech patterns
     const speechAnalysis = sentimentAnalyzer.analyzeSpeakingPatterns(sessionData.speechData);
-    
+
     // Calculate average scores for new metrics
     const avgFacialEngagement = sessionData.facialEngagementData.length > 0 ?
       Math.round(sessionData.facialEngagementData.reduce((sum, item) => sum + item.overallEngagement.score, 0) / sessionData.facialEngagementData.length) : 0;
-    
+
     const avgVolumeLevel = sessionData.volumeData.length > 0 ?
       Math.round(sessionData.volumeData.reduce((sum, item) => sum + item.level, 0) / sessionData.volumeData.length) : 0;
-    
+
     const totalFillerPercentage = speechAnalysis.fillerPercentage;
 
     // Body language summary (optional)
@@ -532,7 +544,7 @@ const Simulator = ({ onEndSimulation }) => {
     }, {});
     const dominantGesture = Object.keys(gestureCounts).length > 0 ?
       Object.keys(gestureCounts).reduce((a, b) => gestureCounts[a] > gestureCounts[b] ? a : b) : 'balanced';
-    
+
     const summary = {
       duration: `${Math.floor(sessionDuration / 60)}:${String(sessionDuration % 60).padStart(2, '0')}`,
       averageConfidence: avgConfidence,
@@ -542,7 +554,7 @@ const Simulator = ({ onEndSimulation }) => {
       speechSentiment: speechAnalysis.avgSentiment,
       speakingRate: speechAnalysis.speakingRate,
       wordCount: speechAnalysis.wordCount,
-      
+
       // New enhanced metrics
       facialEngagement: avgFacialEngagement,
       dominantTone: speechAnalysis.toneAnalysis?.dominantTone || 'neutral',
@@ -551,7 +563,7 @@ const Simulator = ({ onEndSimulation }) => {
       avgPauseDuration: speechAnalysis.avgPauseDuration,
       postureScore: avgPostureScore,
       gestureBalance: dominantGesture,
-      
+
       // Detailed breakdown for dashboard
       detailedAnalysis: {
         facial: sessionData.facialEngagementData,
@@ -562,7 +574,7 @@ const Simulator = ({ onEndSimulation }) => {
         bodyLanguage: sessionData.bodyLanguageData
       }
     };
-    
+
     onEndSimulation(summary);
   };
 
@@ -584,8 +596,8 @@ const Simulator = ({ onEndSimulation }) => {
           <h2>Public Speaking Session</h2>
           <div className="controls">
             {!isRecording ? (
-              <button 
-                className="btn btn-primary" 
+              <button
+                className="btn btn-primary"
                 onClick={startRecording}
                 disabled={!isModelLoaded}
               >
@@ -620,7 +632,7 @@ const Simulator = ({ onEndSimulation }) => {
           <div className="feedback-section">
             <div className="feedback-panel">
               <h3>Real-time Feedback</h3>
-              
+
               {/* Basic metrics */}
               <div className="feedback-item">
                 <label>Current Emotion:</label>
@@ -628,25 +640,25 @@ const Simulator = ({ onEndSimulation }) => {
                   {currentEmotion || 'Detecting...'}
                 </span>
               </div>
-              
+
               <div className="feedback-item">
                 <label>Confidence Level:</label>
                 <div className="progress-bar">
-                  <div 
-                    className="progress-fill" 
+                  <div
+                    className="progress-fill"
                     style={{ width: `${confidence}%` }}
                   ></div>
                   <span className="progress-text">{confidence}%</span>
                 </div>
               </div>
-              
+
               {/* Enhanced facial engagement */}
               {facialEngagement && (
                 <>
                   <div className="feedback-item">
                     <label>Smile Engagement:</label>
                     <div className="engagement-indicator">
-                      <span 
+                      <span
                         className="status-badge"
                         style={{ backgroundColor: getStatusColor(facialEngagement.smile.status) }}
                       >
@@ -660,7 +672,7 @@ const Simulator = ({ onEndSimulation }) => {
                   <div className="feedback-item">
                     <label>Eye Contact:</label>
                     <div className="engagement-indicator">
-                      <span 
+                      <span
                         className="status-badge"
                         style={{ backgroundColor: getStatusColor(facialEngagement.eyeContact.status) }}
                       >
@@ -674,7 +686,7 @@ const Simulator = ({ onEndSimulation }) => {
                   <div className="feedback-item">
                     <label>Nervous Tics:</label>
                     <div className="engagement-indicator">
-                      <span 
+                      <span
                         className="status-badge"
                         style={{ backgroundColor: getStatusColor(facialEngagement.nervousTics.severity === 'none' ? 'excellent' : 'poor') }}
                       >
@@ -704,7 +716,7 @@ const Simulator = ({ onEndSimulation }) => {
                 <div className="feedback-item">
                   <label>Volume Level:</label>
                   <div className="engagement-indicator">
-                    <span 
+                    <span
                       className="status-badge"
                       style={{ backgroundColor: getStatusColor(volumeAnalysis.status) }}
                     >
@@ -720,7 +732,7 @@ const Simulator = ({ onEndSimulation }) => {
                 <div className="feedback-item">
                   <label>Speaking Pace:</label>
                   <div className="engagement-indicator">
-                    <span 
+                    <span
                       className="status-badge"
                       style={{ backgroundColor: getStatusColor(paceAnalysis.status) }}
                     >
@@ -736,7 +748,7 @@ const Simulator = ({ onEndSimulation }) => {
                 <div className="feedback-item">
                   <label>Filler Words:</label>
                   <div className="engagement-indicator">
-                    <span 
+                    <span
                       className="status-badge"
                       style={{ backgroundColor: fillerAnalysis.fillerPercentage > 8 ? '#f44336' : '#4CAF50' }}
                     >
@@ -753,7 +765,7 @@ const Simulator = ({ onEndSimulation }) => {
                 <div className="feedback-item">
                   <label>Posture:</label>
                   <div className="engagement-indicator">
-                    <span 
+                    <span
                       className="status-badge"
                       style={{ backgroundColor: getStatusColor(postureAnalysis.status) }}
                     >
@@ -769,7 +781,7 @@ const Simulator = ({ onEndSimulation }) => {
                 <div className="feedback-item">
                   <label>Gestures:</label>
                   <div className="engagement-indicator">
-                    <span 
+                    <span
                       className="status-badge"
                       style={{ backgroundColor: getStatusColor(gestureAnalysis.status) }}
                     >
@@ -780,7 +792,7 @@ const Simulator = ({ onEndSimulation }) => {
                   <div className="feedback-text">{gestureAnalysis.feedback}</div>
                 </div>
               )}
-              
+
               <div className="feedback-item">
                 <label>Speech Recognition:</label>
                 <div className="speech-status">
@@ -790,6 +802,11 @@ const Simulator = ({ onEndSimulation }) => {
                     <span className="not-listening">🎤 Not listening</span>
                   )}
                 </div>
+                {speechError && (
+                  <div className="feedback-text" style={{ color: '#f44336', marginTop: '5px' }}>
+                    {speechError}
+                  </div>
+                )}
               </div>
             </div>
 

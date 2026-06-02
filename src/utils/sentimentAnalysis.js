@@ -6,23 +6,34 @@ class SentimentAnalyzer {
     this.model = null;
     this.vocabulary = null;
     this.maxLength = 100;
-    this.fillerWords = [
-      'um', 'uh', 'like', 'you know', 'basically', 'actually', 'literally', 'sort of', 'kind of',
+    // Separate single-word and multi-word fillers to prevent double-counting
+    this.singleWordFillers = [
+      'um', 'uh', 'like', 'basically', 'actually', 'literally',
       'well', 'so', 'right', 'okay', 'ok', 'yeah', 'yep', 'hmm', 'erm', 'ah', 'oh',
-      'i mean', 'you see', 'i guess', 'i think', 'i suppose', 'i believe',
-      'sorta', 'kinda', 'ya know', 'y\'know', 'you know what', 'thing is',
+      'sorta', 'kinda'
+    ];
+    this.multiWordFillers = [
+      'you know', 'sort of', 'kind of', 'i mean', 'you see', 'i guess', 'i think',
+      'i suppose', 'i believe', 'ya know', 'y\'know', 'you know what', 'thing is',
       'the thing is', 'what i mean is', 'what i\'m saying is', 'if you know what i mean',
       'and stuff', 'and things', 'and everything', 'and all that', 'and so on',
       'or whatever', 'or something', 'or anything', 'or whatever it is',
       'i don\'t know', 'i dunno', 'i\'m not sure', 'i guess so', 'i suppose so'
     ];
+    // Combined list for backward compat
+    this.fillerWords = [...this.singleWordFillers, ...this.multiWordFillers];
     this.audioContext = null;
     this.analyzer = null;
     this.dataArray = null;
     this.lastSpeechTime = 0;
     this.speechSegments = [];
     this.pauseDurations = [];
+    this.paceHistory = []; // Track recent speaking pace
     this.debugMode = true; // Enable debugging
+    // Cumulative filler tracking across entire session
+    this.cumulativeFillerCount = 0;
+    this.cumulativeWordCount = 0;
+    this.cumulativeFillerWords = [];
   }
 
   // Initialize with a simple sentiment model and audio analysis
@@ -68,25 +79,30 @@ class SentimentAnalyzer {
     }
   }
 
-  // Get current volume level
+  // Get current volume level — focus on speech-frequency bins only
   getVolumeLevel() {
     if (!this.analyzer || !this.dataArray) return 0;
     
     this.analyzer.getByteFrequencyData(this.dataArray);
+    // Only average speech-relevant frequency bins (indices 2-30).
+    // Most speech energy is concentrated here; higher bins are near-zero
+    // and drag the average down, causing perpetual "too soft" readings.
+    const startBin = 2;
+    const endBin = Math.min(30, this.dataArray.length);
     let sum = 0;
-    for (let i = 0; i < this.dataArray.length; i++) {
+    for (let i = startBin; i < endBin; i++) {
       sum += this.dataArray[i];
     }
-    return sum / this.dataArray.length;
+    return sum / (endBin - startBin);
   }
 
-  // Analyze volume feedback
+  // Analyze volume feedback — thresholds tuned for speech-frequency bin averaging
   analyzeVolume(volumeLevel) {
-    if (volumeLevel < 20) {
+    if (volumeLevel < 5) {
       return { status: 'too_soft', message: 'Speak louder - your voice is too soft', level: volumeLevel };
-    } else if (volumeLevel > 180) {
+    } else if (volumeLevel > 160) {
       return { status: 'too_loud', message: 'Lower your voice - you\'re speaking too loudly', level: volumeLevel };
-    } else if (volumeLevel >= 80 && volumeLevel <= 140) {
+    } else if (volumeLevel >= 25 && volumeLevel <= 120) {
       return { status: 'just_right', message: 'Perfect volume level!', level: volumeLevel };
     } else {
       return { status: 'moderate', message: 'Good volume level', level: volumeLevel };
@@ -95,18 +111,27 @@ class SentimentAnalyzer {
 
   // Detect tone based on frequency analysis and text patterns
   detectTone(text, volumeLevel, frequencyData) {
-    const words = text.toLowerCase().split(/\s+/);
+    const words = text.toLowerCase().split(/\s+/).filter(w => w.length > 0);
     let toneScore = {
       confident: 0,
+      neutral: 0,
       monotone: 0,
       enthusiastic: 0,
       anxious: 0
     };
 
-    // Text-based tone indicators
-    const confidentWords = ['will', 'can', 'know', 'believe', 'certain', 'sure', 'definitely', 'absolutely'];
-    const enthusiasticWords = ['great', 'amazing', 'excited', 'wonderful', 'fantastic', 'love', 'awesome'];
-    const anxiousWords = ['maybe', 'perhaps', 'might', 'possibly', 'nervous', 'worried', 'unsure'];
+    // Baseline: speaking at all is somewhat confident; neutral gets a base score
+    // so that when no strong signals are present, we default to neutral
+    toneScore.neutral = 2;
+    if (words.length > 5) toneScore.confident += 1;
+
+    // Text-based tone indicators (expanded confident list)
+    const confidentWords = ['will', 'can', 'know', 'believe', 'certain', 'sure', 'definitely', 'absolutely',
+      'clearly', 'must', 'indeed', 'exactly', 'precisely', 'always', 'never', 'important'];
+    const enthusiasticWords = ['great', 'amazing', 'excited', 'wonderful', 'fantastic', 'love', 'awesome',
+      'excellent', 'brilliant', 'incredible', 'thrilled', 'passionate'];
+    const anxiousWords = ['maybe', 'perhaps', 'might', 'possibly', 'nervous', 'worried', 'unsure',
+      'afraid', 'scared', 'anxious'];
     const fillerCount = this.countFillerWords(text);
 
     words.forEach(word => {
@@ -115,39 +140,49 @@ class SentimentAnalyzer {
       if (anxiousWords.includes(word)) toneScore.anxious += 1;
     });
 
-    // Volume-based tone analysis
-    if (volumeLevel > 120) {
-      toneScore.enthusiastic += 2;
+    // Volume-based tone analysis — only penalize at very low levels
+    if (volumeLevel > 80) {
+      toneScore.enthusiastic += 1;
       toneScore.confident += 1;
-    } else if (volumeLevel < 40) {
-      toneScore.anxious += 2;
-      toneScore.monotone += 1;
+    } else if (volumeLevel < 10) {
+      // Only flag anxiety at extremely low volume
+      toneScore.anxious += 1;
     }
 
-    // Filler words indicate anxiety
-    if (fillerCount > words.length * 0.1) {
-      toneScore.anxious += 3;
+    // Filler words indicate anxiety — mild penalty only at high rates
+    if (words.length > 0 && fillerCount > words.length * 0.15) {
+      toneScore.anxious += 1;
     }
 
     // Frequency analysis for monotone detection
     if (frequencyData) {
       const variability = this.calculateFrequencyVariability(frequencyData);
-      if (variability < 10) {
-        toneScore.monotone += 3;
+      if (variability < 5) {
+        toneScore.monotone += 2;
       } else if (variability > 30) {
-        toneScore.enthusiastic += 2;
+        toneScore.enthusiastic += 1;
       }
     }
 
-    // Determine dominant tone
-    const maxTone = Object.keys(toneScore).reduce((a, b) => 
-      toneScore[a] > toneScore[b] ? a : b
-    );
+    // Determine dominant tone — exclude neutral from "winning" unless nothing else scores
+    const nonNeutralScores = { confident: toneScore.confident, monotone: toneScore.monotone,
+      enthusiastic: toneScore.enthusiastic, anxious: toneScore.anxious };
+    const maxNonNeutral = Math.max(...Object.values(nonNeutralScores));
+
+    let maxTone;
+    if (maxNonNeutral >= toneScore.neutral) {
+      // A real tone signal exists
+      maxTone = Object.keys(nonNeutralScores).reduce((a, b) =>
+        nonNeutralScores[a] > nonNeutralScores[b] ? a : b
+      );
+    } else {
+      maxTone = 'neutral';
+    }
 
     return {
       dominantTone: maxTone,
       scores: toneScore,
-      confidence: Math.min(100, Math.max(20, toneScore[maxTone] * 20))
+      confidence: Math.min(100, Math.max(20, toneScore[maxTone] * 15 + 20))
     };
   }
 
@@ -160,44 +195,55 @@ class SentimentAnalyzer {
     return Math.sqrt(variance);
   }
 
-  // Count filler words in text
+  // Count filler words in text — prevents double-counting multi-word fillers
   countFillerWords(text) {
     if (!text || text.trim().length === 0) return 0;
     
     // Clean and normalize text
     const cleanText = text.toLowerCase()
-      .replace(/[^\w\s]/g, ' ') // Remove punctuation but keep spaces
+      .replace(/[^\w\s']/g, ' ') // Remove punctuation but keep apostrophes and spaces
       .replace(/\s+/g, ' ') // Normalize spaces
       .trim();
     
     const words = cleanText.split(' ');
     let fillerCount = 0;
     const detectedFillers = [];
+    // Track which word indices are already consumed by a multi-word filler
+    const consumed = new Set();
     
-    // Check for single word fillers
+    // Check for multi-word fillers FIRST (longest match wins, prevents double-counting)
+    // Sort by word count descending so longer phrases match first
+    const sortedMulti = [...this.multiWordFillers].sort((a, b) =>
+      b.split(' ').length - a.split(' ').length
+    );
+    
+    for (const phrase of sortedMulti) {
+      const phraseWords = phrase.split(' ');
+      const phraseLen = phraseWords.length;
+      for (let i = 0; i <= words.length - phraseLen; i++) {
+        // Skip if any index already consumed
+        let alreadyUsed = false;
+        for (let j = 0; j < phraseLen; j++) {
+          if (consumed.has(i + j)) { alreadyUsed = true; break; }
+        }
+        if (alreadyUsed) continue;
+        
+        const candidate = words.slice(i, i + phraseLen).join(' ');
+        if (candidate === phrase) {
+          fillerCount++;
+          detectedFillers.push(phrase);
+          for (let j = 0; j < phraseLen; j++) consumed.add(i + j);
+        }
+      }
+    }
+    
+    // Check for single-word fillers (skip already consumed indices)
     for (let i = 0; i < words.length; i++) {
-      const word = words[i];
-      if (this.fillerWords.includes(word)) {
+      if (consumed.has(i)) continue;
+      if (this.singleWordFillers.includes(words[i])) {
         fillerCount++;
-        detectedFillers.push(word);
-      }
-    }
-    
-    // Check for multi-word fillers
-    for (let i = 0; i < words.length - 1; i++) {
-      const twoWordPhrase = `${words[i]} ${words[i + 1]}`;
-      if (this.fillerWords.includes(twoWordPhrase)) {
-        fillerCount++;
-        detectedFillers.push(twoWordPhrase);
-      }
-    }
-    
-    // Check for three-word fillers
-    for (let i = 0; i < words.length - 2; i++) {
-      const threeWordPhrase = `${words[i]} ${words[i + 1]} ${words[i + 2]}`;
-      if (this.fillerWords.includes(threeWordPhrase)) {
-        fillerCount++;
-        detectedFillers.push(threeWordPhrase);
+        detectedFillers.push(words[i]);
+        consumed.add(i);
       }
     }
     
@@ -212,50 +258,37 @@ class SentimentAnalyzer {
     return fillerCount;
   }
 
-  // Detect filler words and pauses
+  // Detect filler words and pauses — with cumulative session tracking
   detectFillersAndPauses(text, timestamp) {
     if (!text || text.trim().length === 0) {
       return {
-        fillerCount: 0,
-        fillerPercentage: 0,
-        fillerWords: [],
+        fillerCount: this.cumulativeFillerCount,
+        fillerPercentage: this.cumulativeWordCount > 0
+          ? Math.round((this.cumulativeFillerCount / this.cumulativeWordCount) * 1000) / 10
+          : 0,
+        fillerWords: this.cumulativeFillerWords,
         feedback: 'No speech detected yet',
         avgPauseDuration: 0
       };
     }
     
-    // Clean and normalize text
+    // Count fillers in THIS chunk using the improved countFillerWords
+    const chunkFillerCount = this.countFillerWords(text);
+    
+    // Clean text to count words
     const cleanText = text.toLowerCase()
-      .replace(/[^\w\s]/g, ' ')
+      .replace(/[^\w\s']/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
+    const words = cleanText.split(' ').filter(w => w.length > 0);
     
-    const words = cleanText.split(' ');
-    const detectedFillers = [];
+    // Detect which fillers are in this chunk for display
+    const chunkDetectedFillers = this._extractFillerList(cleanText);
     
-    // Check for single word fillers
-    for (let i = 0; i < words.length; i++) {
-      const word = words[i];
-      if (this.fillerWords.includes(word)) {
-        detectedFillers.push(word);
-      }
-    }
-    
-    // Check for multi-word fillers
-    for (let i = 0; i < words.length - 1; i++) {
-      const twoWordPhrase = `${words[i]} ${words[i + 1]}`;
-      if (this.fillerWords.includes(twoWordPhrase)) {
-        detectedFillers.push(twoWordPhrase);
-      }
-    }
-    
-    // Check for three-word fillers
-    for (let i = 0; i < words.length - 2; i++) {
-      const threeWordPhrase = `${words[i]} ${words[i + 1]} ${words[i + 2]}`;
-      if (this.fillerWords.includes(threeWordPhrase)) {
-        detectedFillers.push(threeWordPhrase);
-      }
-    }
+    // Accumulate into session totals
+    this.cumulativeFillerCount += chunkFillerCount;
+    this.cumulativeWordCount += words.length;
+    this.cumulativeFillerWords.push(...chunkDetectedFillers);
     
     // Track speech timing for pause detection
     if (this.lastSpeechTime > 0) {
@@ -266,15 +299,18 @@ class SentimentAnalyzer {
     }
     this.lastSpeechTime = timestamp;
 
-    // Calculate filler word percentage
-    const fillerCount = detectedFillers.length;
-    const fillerPercentage = words.length > 0 ? (fillerCount / words.length) * 100 : 0;
+    // Calculate filler word percentage from SESSION totals
+    const fillerPercentage = this.cumulativeWordCount > 0
+      ? (this.cumulativeFillerCount / this.cumulativeWordCount) * 100
+      : 0;
     
     let feedback = '';
     if (fillerPercentage > 15) {
       feedback = 'Too many filler words - try to pause instead of saying "um" or "uh"';
     } else if (fillerPercentage > 8) {
       feedback = 'Some filler words detected - try to reduce them';
+    } else if (this.cumulativeFillerCount === 0) {
+      feedback = 'Great! No filler words detected';
     } else if (fillerPercentage < 3) {
       feedback = 'Great! Very few filler words';
     } else {
@@ -282,44 +318,102 @@ class SentimentAnalyzer {
     }
 
     // Debug logging
-    if (this.debugMode) {
+    if (this.debugMode && chunkDetectedFillers.length > 0) {
       console.log('=== Filler Word Analysis ===');
-      console.log('Original text:', text);
-      console.log('Clean text:', cleanText);
-      console.log('Total words:', words.length);
-      console.log('Detected fillers:', detectedFillers);
-      console.log('Filler count:', fillerCount);
-      console.log('Filler percentage:', fillerPercentage.toFixed(1) + '%');
-      console.log('Feedback:', feedback);
+      console.log('Chunk text:', text);
+      console.log('Chunk fillers:', chunkDetectedFillers);
+      console.log('Session total fillers:', this.cumulativeFillerCount);
+      console.log('Session total words:', this.cumulativeWordCount);
+      console.log('Session filler %:', fillerPercentage.toFixed(1) + '%');
       console.log('===========================');
     }
 
     return {
-      fillerCount: fillerCount,
+      fillerCount: this.cumulativeFillerCount,
       fillerPercentage: Math.round(fillerPercentage * 10) / 10,
-      fillerWords: detectedFillers,
+      fillerWords: this.cumulativeFillerWords,
       feedback: feedback,
       avgPauseDuration: this.pauseDurations.length > 0 ? 
         this.pauseDurations.reduce((a, b) => a + b, 0) / this.pauseDurations.length : 0
     };
   }
 
-  // Analyze speaking pace
-  analyzeSpeakingPace(words, timeSpan) {
+  // Helper: extract the list of filler words found in text (for display)
+  _extractFillerList(cleanText) {
+    const words = cleanText.split(' ').filter(w => w.length > 0);
+    const detected = [];
+    const consumed = new Set();
+    
+    const sortedMulti = [...this.multiWordFillers].sort((a, b) =>
+      b.split(' ').length - a.split(' ').length
+    );
+    
+    for (const phrase of sortedMulti) {
+      const phraseWords = phrase.split(' ');
+      const phraseLen = phraseWords.length;
+      for (let i = 0; i <= words.length - phraseLen; i++) {
+        let alreadyUsed = false;
+        for (let j = 0; j < phraseLen; j++) {
+          if (consumed.has(i + j)) { alreadyUsed = true; break; }
+        }
+        if (alreadyUsed) continue;
+        if (words.slice(i, i + phraseLen).join(' ') === phrase) {
+          detected.push(phrase);
+          for (let j = 0; j < phraseLen; j++) consumed.add(i + j);
+        }
+      }
+    }
+    
+    for (let i = 0; i < words.length; i++) {
+      if (consumed.has(i)) continue;
+      if (this.singleWordFillers.includes(words[i])) {
+        detected.push(words[i]);
+        consumed.add(i);
+      }
+    }
+    
+    return detected;
+  }
+
+  // Analyze speaking pace - Uses rolling window for responsive WPM
+  analyzeSpeakingPace(words, timeSpan, isNewSegment = false) {
     if (timeSpan <= 0) return { wpm: 0, feedback: 'Start speaking to analyze pace', status: 'unknown' };
     
-    const wordsPerMinute = Math.round((words / (timeSpan / 1000)) * 60);
+    // If it's a new segment, add it to history to calculate rolling WPM
+    if (isNewSegment) {
+      this.paceHistory.push({ words, time: Date.now() });
+      // Keep only the last 15 seconds of speaking history
+      const cutoff = Date.now() - 15000;
+      this.paceHistory = this.paceHistory.filter(item => item.time > cutoff);
+    }
     
+    let wordsPerMinute = 0;
+    
+    if (this.paceHistory.length > 1) {
+      // Calculate WPM over the rolling window
+      const recentWords = this.paceHistory.reduce((sum, item) => sum + item.words, 0);
+      const timeDiffMs = this.paceHistory[this.paceHistory.length - 1].time - this.paceHistory[0].time;
+      // Add a small buffer to avoid division by zero or inflated WPM on rapid events
+      const rollingTimeSpan = Math.max(timeDiffMs, 2000); 
+      wordsPerMinute = Math.round((recentWords / (rollingTimeSpan / 1000)) * 60);
+    } else {
+      // Fallback to overall session pace if history is too short
+      wordsPerMinute = Math.round((words / (timeSpan / 1000)) * 60);
+    }
+    
+    // Prevent erratic jumps by capping WPM to reasonable human limits
+    wordsPerMinute = Math.min(wordsPerMinute, 300);
+
     let feedback = '';
     let status = '';
     
-    if (wordsPerMinute < 120) {
-      feedback = 'Speaking too slowly - try to increase your pace slightly';
+    if (wordsPerMinute < 100) {
+      feedback = 'Speaking slowly - try to increase your pace slightly';
       status = 'too_slow';
-    } else if (wordsPerMinute > 200) {
-      feedback = 'Speaking too fast - slow down to improve clarity';
+    } else if (wordsPerMinute > 180) {
+      feedback = 'Speaking quickly - slow down to improve clarity';
       status = 'too_fast';
-    } else if (wordsPerMinute >= 140 && wordsPerMinute <= 180) {
+    } else if (wordsPerMinute >= 120 && wordsPerMinute <= 160) {
       feedback = 'Perfect speaking pace!';
       status = 'ideal';
     } else {
@@ -534,7 +628,12 @@ class SentimentAnalyzer {
   resetSession() {
     this.speechSegments = [];
     this.pauseDurations = [];
+    this.paceHistory = [];
     this.lastSpeechTime = 0;
+    // Reset cumulative filler tracking
+    this.cumulativeFillerCount = 0;
+    this.cumulativeWordCount = 0;
+    this.cumulativeFillerWords = [];
   }
 
   // Test filler word detection with sample text

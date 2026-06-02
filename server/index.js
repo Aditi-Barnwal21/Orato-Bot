@@ -156,8 +156,8 @@ function parseJSON(text) {
 }
 
 app.post('/api/generate-questions', async (req, res) => {
+	const { profileText, numQuestions } = req.body || {};
 	try {
-		const { profileText, numQuestions } = req.body || {};
 		if (!profileText || typeof profileText !== 'string') {
 			return res.status(400).json({ error: 'profileText is required' });
 		}
@@ -179,13 +179,45 @@ app.post('/api/generate-questions', async (req, res) => {
 		return res.json({ questions });
 	} catch (err) {
 		console.error('generate-questions error:', err.message);
-		return res.status(500).json({ error: 'Failed to generate questions' });
+		
+		// Fallback questions so the UI doesn't crash on Rate Limit
+		const topic = (profileText || '').toLowerCase();
+		let specificSkill = 'your field';
+		if (topic.includes('react')) specificSkill = 'React';
+		else if (topic.includes('python')) specificSkill = 'Python';
+		else if (topic.includes('java')) specificSkill = 'Java';
+		else if (topic.includes('design')) specificSkill = 'Design';
+		else if (topic.includes('marketing')) specificSkill = 'Marketing';
+		else if (topic.includes('data')) specificSkill = 'Data Analysis';
+		else if (topic.includes('node')) specificSkill = 'Node.js';
+		
+		const fallbackBank = [
+			{ id: 'q1', type: 'behavioral', question: `Tell me about a time you had to overcome a significant challenge in ${specificSkill}.` },
+			{ id: 'q2', type: 'technical', question: `How do you approach solving a complex problem in ${specificSkill} when you do not have all the necessary information?` },
+			{ id: 'q3', type: 'behavioral', question: 'Describe a situation where you had to work with a difficult team member on a project. How did you handle it?' },
+			{ id: 'q4', type: 'stress', question: 'If you realized you made a critical mistake right before a major deadline, what steps would you take?' },
+			{ id: 'q5', type: 'technical', question: `Explain a recent technical concept or tool related to ${specificSkill} that you learned, to someone with no background in it.` },
+			{ id: 'q6', type: 'behavioral', question: `Where do you see your career progressing in the next five years regarding ${specificSkill}?` },
+			{ id: 'q7', type: 'technical', question: `Describe a time when you had to optimize a process or system in ${specificSkill}. What was your approach?` },
+			{ id: 'q8', type: 'behavioral', question: 'Tell me about a time you strongly disagreed with your manager. How did you resolve it?' },
+			{ id: 'q9', type: 'stress', question: `How do you prioritize tasks when you have multiple urgent deadlines in ${specificSkill}?` },
+			{ id: 'q10', type: 'technical', question: `What is the most complex project you have built or managed in ${specificSkill}?` },
+			{ id: 'q11', type: 'behavioral', question: 'Tell me about a time you took a leadership role in a project unexpectedly.' },
+			{ id: 'q12', type: 'stress', question: 'Describe a time when a project you were working on completely failed. What did you learn?' }
+		];
+		
+		// Shuffle and pick 6 questions
+		const shuffled = fallbackBank.sort(() => 0.5 - Math.random());
+		const fallbackQuestions = shuffled.slice(0, 6);
+		
+		console.log('Returning randomized fallback questions due to API error.');
+		return res.json({ questions: fallbackQuestions, isFallback: true });
 	}
 });
 
 app.post('/api/evaluate-answer', async (req, res) => {
+	const { question, answer, modalities } = req.body || {};
 	try {
-		const { question, answer, modalities } = req.body || {};
 		if (!question || !answer) return res.status(400).json({ error: 'question and answer are required' });
 
 		const prompt = buildEvaluationPrompt(question, answer);
@@ -199,8 +231,16 @@ app.post('/api/evaluate-answer', async (req, res) => {
 		const voice = modalities?.voice || {};
 		const facial = modalities?.facial || {};
 
-		const technical = Math.max(0, Math.min(100, Number(json?.technicalAccuracy?.score) || 0));
-		const clarity = Math.max(0, Math.min(100, Number(json?.clarity?.score) || 0));
+		const base = json?.scores || json;
+		
+		let rawTech = base?.technicalAccuracy?.score ?? base?.technicalAccuracy ?? base?.technical_accuracy ?? base?.technical ?? 0;
+		if (typeof rawTech === 'object') rawTech = rawTech.score || 0;
+		
+		let rawClarity = base?.clarity?.score ?? base?.clarity ?? base?.communication?.score ?? base?.communication ?? 0;
+		if (typeof rawClarity === 'object') rawClarity = rawClarity.score || 0;
+
+		const technical = Math.max(0, Math.min(100, Number(rawTech) || 0));
+		const clarity = Math.max(0, Math.min(100, Number(rawClarity) || 0));
 
 		const voiceConfidence = Math.min(100, Math.max(0, (voice.toneConfidence || 50)));
 		const postureScore = Math.min(100, Math.max(0, (facial.postureScore || 50)));
@@ -216,7 +256,21 @@ app.post('/api/evaluate-answer', async (req, res) => {
 		});
 	} catch (err) {
 		console.error('evaluate-answer error:', err.message);
-		return res.status(500).json({ error: 'Failed to evaluate answer' });
+		// Return a generic fallback evaluation so the UI doesn't break
+		const voice = modalities?.voice || {};
+		const facial = modalities?.facial || {};
+		
+		const technicalScore = Math.min(100, Math.max(50, 70 + (answer.length > 50 ? 15 : 0)));
+		const clarityScore = Math.min(100, Math.max(0, 100 - (voice.fillerCount || 0) * 5));
+		const confidenceScore = Math.min(100, Math.max(0, Math.round(0.5 * (voice.toneConfidence || 60) + 0.25 * (facial.postureScore || 60) + 0.25 * (facial.eyeContact || 60))));
+
+		return res.json({
+			scores: { technicalAccuracy: technicalScore, clarity: clarityScore, confidence: confidenceScore },
+			feedback: {
+				overall: `(Fallback Evaluation - API Rate Limited). You spoke ${answer.trim().split(/\s+/).length} words. ${voice.fillerCount > 3 ? 'Try to reduce your filler words.' : 'Good clarity.'} ${facial.eyeContact < 50 ? 'Make sure to maintain eye contact with the camera.' : 'Great eye contact.'}`,
+				tips: ["Use the STAR method", "Provide specific metrics"]
+			}
+		});
 	}
 });
 

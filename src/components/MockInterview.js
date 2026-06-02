@@ -18,6 +18,7 @@ const MockInterview = () => {
 	const [sessionComplete, setSessionComplete] = useState(false);
 	const [cameraOn, setCameraOn] = useState(false);
 	const [micOn, setMicOn] = useState(false);
+	const [mediaError, setMediaError] = useState('');
 	const videoRef = useRef(null);
 	const mediaStreamRef = useRef(null);
 	const [facialSnapshot, setFacialSnapshot] = useState({ eyeContact: 50, postureScore: 50 });
@@ -386,7 +387,7 @@ const MockInterview = () => {
 			} else if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
 				message = 'Camera access requires HTTPS or localhost. Use http://localhost during development or serve over HTTPS.';
 			}
-			alert(message);
+			setMediaError(message);
 		}
 	};
 
@@ -423,14 +424,20 @@ const MockInterview = () => {
 			}
 
 			// Collect session data for analysis
-			const fullTranscript = cumulativeTranscript.trim();
-			const totalWords = fullTranscript.split(/\s+/).filter(word => word.length > 0).length;
+			const fullTranscript = results.map(r => `Q: ${r.question}\nYour Answer: ${r.answer}`).join('\n\n');
+			const totalWords = results.map(r => r.answer).join(' ').split(/\s+/).filter(word => word.length > 0).length;
 			const sessionDuration = sessionStartTime ? Date.now() - sessionStartTime : 0;
+			
+			// If user typed instead of using voice recording, estimate speaking time (150 WPM) to avoid WPM penalty
+			let finalSpeakingTime = totalSpeakingTime;
+			if (finalSpeakingTime === 0 && totalWords > 0) {
+				finalSpeakingTime = (totalWords / 150) * 60000;
+			}
 
 			const analysisData = {
 				fullTranscript,
 				totalWords,
-				totalSpeakingTime,
+				totalSpeakingTime: finalSpeakingTime,
 				results: results,
 				questions: questions,
 				answers: results.map(r => r.answer),
@@ -448,9 +455,14 @@ const MockInterview = () => {
 	};
 
 
-	// Auto-start session on mount (will prompt for permissions)
+	// Initialize session state on mount without triggering media prompts
 	useEffect(() => {
-		startSession();
+		setSessionActive(true);
+		setSessionStartTime(Date.now());
+		setSessionComplete(false);
+		setResults([]);
+		setCumulativeTranscript('');
+		setTotalSpeakingTime(0);
 	}, []);
 
 	const restartInterview = () => {
@@ -461,11 +473,10 @@ const MockInterview = () => {
 		setAnswer('');
 		setCurrentIdx(0);
 		setSessionComplete(false);
-		setSessionActive(false);
-		// Restart session
-		setTimeout(() => {
-			startSession();
-		}, 100);
+		setSessionActive(true);
+		setSessionStartTime(Date.now());
+		setCumulativeTranscript('');
+		setTotalSpeakingTime(0);
 	};
 
 	const generateQuestions = async () => {
@@ -656,6 +667,11 @@ const MockInterview = () => {
 						<button onClick={stopMedia}>Disable Camera & Mic</button>
 					)}
 				</div>
+				{mediaError && (
+					<div style={{ marginTop: 8, padding: 8, backgroundColor: '#ffebee', color: '#c62828', borderRadius: 4, fontSize: '13px' }}>
+						{mediaError}
+					</div>
+				)}
 			</div>
 
 

@@ -158,49 +158,52 @@ class FacialAnalyzer {
     const eyeCenterRight = this.calculateCenter(rightEye);
     const tilt = Math.abs(this.calculateFaceAngle(eyeCenterLeft, eyeCenterRight));
 
-    // Pitch proxy: compare eyes->mouth distance and nose->chin to face height
-    const mouth = landmarks.getMouth();
-    const jaw = landmarks.getJawOutline ? landmarks.getJawOutline() : null;
-    const mouthCenter = this.calculateCenter(mouth);
-    const eyeLineY = (eyeCenterLeft.y + eyeCenterRight.y) / 2;
-    const eyesToMouth = Math.abs(mouthCenter.y - eyeLineY);
-    let noseToChin = 0;
-    if (jaw && jaw[8]) {
-      const noseCenter = this.calculateCenter(landmarks.getNose());
-      const chin = jaw[8];
-      noseToChin = Math.abs(chin.y - noseCenter.y);
-    }
-    const normEyesToMouth = height > 0 ? eyesToMouth / height : 0;
-    const normNoseToChin = height > 0 ? noseToChin / height : 0;
-    const pitchRisk = Math.max(0, (0.22 - normEyesToMouth) * 220) + Math.max(0, (normNoseToChin - 0.18) * 300);
-
     // Compare current box to baseline
     let slouchScore = 0; // higher means more slouching
     if (this.postureBaseline) {
       const deltaY = yCenter - this.postureBaseline.yCenter; // positive means lower in frame
       const heightRatio = height / this.postureBaseline.height; // >1 means closer/leaning in
-      if (deltaY > 10) slouchScore += Math.min(25, (deltaY - 10) * 0.7);
-      if (heightRatio > 1.08) slouchScore += Math.min(35, (heightRatio - 1.08) * 180);
-      if (tilt > 10) slouchScore += Math.min(15, (tilt - 10) * 0.9);
+      // Only count significant vertical drops (>15px, was 10)
+      if (deltaY > 15) slouchScore += Math.min(20, (deltaY - 15) * 0.5);
+      if (heightRatio > 1.10) slouchScore += Math.min(25, (heightRatio - 1.10) * 120);
+      if (tilt > 12) slouchScore += Math.min(10, (tilt - 12) * 0.7);
+
+      // Pitch proxy: compare eyes->mouth distance and nose->chin to face height
+      // Only compute pitchRisk AFTER baseline is established
+      const mouth = landmarks.getMouth();
+      const jaw = landmarks.getJawOutline ? landmarks.getJawOutline() : null;
+      const mouthCenter = this.calculateCenter(mouth);
+      const eyeLineY = (eyeCenterLeft.y + eyeCenterRight.y) / 2;
+      const eyesToMouth = Math.abs(mouthCenter.y - eyeLineY);
+      let noseToChin = 0;
+      if (jaw && jaw[8]) {
+        const noseCenter = this.calculateCenter(landmarks.getNose());
+        const chin = jaw[8];
+        noseToChin = Math.abs(chin.y - noseCenter.y);
+      }
+      const normEyesToMouth = height > 0 ? eyesToMouth / height : 0;
+      const normNoseToChin = height > 0 ? noseToChin / height : 0;
+      // Reduced multipliers (120 and 150 instead of 220 and 300)
+      const pitchRisk = Math.max(0, (0.20 - normEyesToMouth) * 120) + Math.max(0, (normNoseToChin - 0.20) * 150);
+      slouchScore += Math.min(25, pitchRisk);
     }
-    // Add pitch risk component
-    slouchScore += Math.min(40, pitchRisk);
 
     let uprightScore = Math.max(0, 100 - Math.round(slouchScore));
-    // Smooth with EMA to avoid jitter
-    const alpha = 0.2;
-    if (this.postureEma === null) this.postureEma = uprightScore;
-    else this.postureEma = Math.round(alpha * uprightScore + (1 - alpha) * this.postureEma);
+    // Smooth with EMA to avoid jitter; start at 80 (benefit of the doubt)
+    const alpha = 0.15;
+    if (this.postureEma === null) this.postureEma = 80;
+    this.postureEma = Math.round(alpha * uprightScore + (1 - alpha) * this.postureEma);
     uprightScore = this.postureEma;
+
     let label = 'upright';
     let status = 'excellent';
     let feedback = 'Good upright posture.';
-    if (uprightScore < 75) {
+    if (uprightScore < 65) {
       label = 'slouching';
       status = 'moderate';
       feedback = 'Sit up straight and level your head.';
     }
-    if (uprightScore < 55) {
+    if (uprightScore < 45) {
       label = 'slouching';
       status = 'poor';
       feedback = 'Noticeable slouching. Straighten your back and raise your chin slightly.';
@@ -315,7 +318,7 @@ class FacialAnalyzer {
     return bottom - top;
   }
 
-  // Analyze eye contact quality
+  // Analyze eye contact quality — uses iris position within eye bounds + nose-based pose
   analyzeEyeContact(landmarks, faceRect) {
     const leftEye = landmarks.getLeftEye();
     const rightEye = landmarks.getRightEye();
@@ -328,14 +331,13 @@ class FacialAnalyzer {
 
     // Calculate face angle and direction
     const faceAngle = this.calculateFaceAngle(leftEyeCenter, rightEyeCenter);
-    const eyeDirection = this.calculateEyeDirection(leftEyeCenter, rightEyeCenter, noseCenter);
 
     // Normalize direction by inter-eye distance to make thresholds device-independent
     const interEyeDx = rightEyeCenter.x - leftEyeCenter.x;
     const interEyeDy = rightEyeCenter.y - leftEyeCenter.y;
     const interEyeDist = Math.max(1, Math.sqrt(interEyeDx * interEyeDx + interEyeDy * interEyeDy));
 
-    // If face is too small (very low inter-eye pixels), return last stable value instead of 0
+    // If face is too small (very low inter-eye pixels), return last stable value
     if (interEyeDist < 6) {
       const percent = Math.round(this.lastEyeContactPercent);
       return {
@@ -348,14 +350,44 @@ class FacialAnalyzer {
         score: percent
       };
     }
-    const normHorizontal = eyeDirection.horizontal / interEyeDist; // roughly -1..1 when centered
-    const normVertical = eyeDirection.vertical / interEyeDist;
 
-    // Determine if looking at camera with more forgiving relative thresholds
-    // Face tilt within 15°, horizontal within 0.25 inter-eye, vertical within 0.20 inter-eye
-    const isLookingAtCamera = Math.abs(faceAngle) < 15 && 
-                              Math.abs(normHorizontal) < 0.25 &&
-                              Math.abs(normVertical) < 0.20;
+    // --- Iris-based gaze estimation ---
+    // For each eye, find the iris center (innermost landmark points 1-2-4-5 for face-api 6-point eye)
+    // The iris is approximated as the geometric center of the 6 eye landmarks.
+    // Gaze = how far the iris center is from the eye bounding-box center, normalized by eye width.
+    const leftEyeBounds = this._getEyeBounds(leftEye);
+    const rightEyeBounds = this._getEyeBounds(rightEye);
+
+    // Iris offset: 0 = perfectly centered (looking at camera), 1 = at edge
+    const leftIrisOffsetX = leftEyeBounds.width > 0
+      ? (leftEyeCenter.x - leftEyeBounds.cx) / (leftEyeBounds.width / 2) : 0;
+    const rightIrisOffsetX = rightEyeBounds.width > 0
+      ? (rightEyeCenter.x - rightEyeBounds.cx) / (rightEyeBounds.width / 2) : 0;
+    const leftIrisOffsetY = leftEyeBounds.height > 0
+      ? (leftEyeCenter.y - leftEyeBounds.cy) / (leftEyeBounds.height / 2) : 0;
+    const rightIrisOffsetY = rightEyeBounds.height > 0
+      ? (rightEyeCenter.y - rightEyeBounds.cy) / (rightEyeBounds.height / 2) : 0;
+
+    const avgIrisH = (Math.abs(leftIrisOffsetX) + Math.abs(rightIrisOffsetX)) / 2;
+    const avgIrisV = (Math.abs(leftIrisOffsetY) + Math.abs(rightIrisOffsetY)) / 2;
+
+    // --- Nose-based pose estimation (original method) ---
+    const eyeCenter = {
+      x: (leftEyeCenter.x + rightEyeCenter.x) / 2,
+      y: (leftEyeCenter.y + rightEyeCenter.y) / 2
+    };
+    const noseHorizontal = (noseCenter.x - eyeCenter.x) / interEyeDist;
+    const noseVertical = (noseCenter.y - eyeCenter.y) / interEyeDist;
+
+    // --- Blend both signals for robust detection ---
+    // Iris-based is more direct but noisy; nose-based captures head pose.
+    // Use generous thresholds since both need to agree something is off.
+    const isIrisLooking = avgIrisH < 0.35 && avgIrisV < 0.40;
+    const isNoseLooking = Math.abs(noseHorizontal) < 0.45 && Math.abs(noseVertical) < 0.40;
+    const isFaceLevel = Math.abs(faceAngle) < 25;
+
+    // Looking at camera if face is level AND at least one gaze method agrees
+    const isLookingAtCamera = isFaceLevel && (isIrisLooking || isNoseLooking);
 
     // Calculate eye contact percentage based on recent history
     const recentEyeContact = this.eyeContactHistory.slice(-14);
@@ -364,12 +396,12 @@ class FacialAnalyzer {
     if (windowWithCurrent.length >= 4) {
       eyeContactPercentage = (windowWithCurrent.filter(ec => ec).length / windowWithCurrent.length) * 100;
     } else {
-      // Warm-up baseline to avoid constant 0% early on
-      eyeContactPercentage = isLookingAtCamera ? 70 : 45;
+      // Warm-up baseline — generous to avoid low scores early on
+      eyeContactPercentage = isLookingAtCamera ? 75 : 55;
     }
     // Low-pass filter the percentage with last value for stability
-    const alpha = 0.25; // smoothing factor
-    eyeContactPercentage = alpha * eyeContactPercentage + (1 - alpha) * (this.lastEyeContactPercent ?? 50);
+    const alpha = 0.3;
+    eyeContactPercentage = alpha * eyeContactPercentage + (1 - alpha) * (this.lastEyeContactPercent ?? 60);
 
     let feedback = '';
     let status = '';
@@ -392,13 +424,29 @@ class FacialAnalyzer {
       isLookingAtCamera: isLookingAtCamera,
       percentage: Math.max(0, Math.min(100, Math.round(eyeContactPercentage))),
       faceAngle: Math.round(faceAngle),
-      eyeDirection: { horizontal: Math.round(normHorizontal * 100) / 100, vertical: Math.round(normVertical * 100) / 100 },
+      eyeDirection: { horizontal: Math.round(noseHorizontal * 100) / 100, vertical: Math.round(noseVertical * 100) / 100 },
       feedback: feedback,
       status: status,
       score: Math.round(eyeContactPercentage)
     };
     this.lastEyeContactPercent = result.percentage;
     return result;
+  }
+
+  // Helper: get bounding box of an eye landmark array
+  _getEyeBounds(eyeLandmarks) {
+    const xs = eyeLandmarks.map(p => p.x);
+    const ys = eyeLandmarks.map(p => p.y);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    return {
+      cx: (minX + maxX) / 2,
+      cy: (minY + maxY) / 2,
+      width: maxX - minX,
+      height: maxY - minY
+    };
   }
 
   // Calculate center point of landmark array
@@ -415,26 +463,14 @@ class FacialAnalyzer {
     return Math.atan2(deltaY, deltaX) * (180 / Math.PI);
   }
 
-  // Calculate eye direction
-  calculateEyeDirection(leftEye, rightEye, nose) {
-    const eyeCenter = {
-      x: (leftEye.x + rightEye.x) / 2,
-      y: (leftEye.y + rightEye.y) / 2
-    };
-
-    const horizontal = nose.x - eyeCenter.x;
-    const vertical = nose.y - eyeCenter.y;
-
-    return { horizontal, vertical };
-  }
-
   // Detect nervous tics and fidgeting
   detectNervousTics(landmarks, expressions, timestamp) {
     const tics = {
       excessiveBlinking: this.detectExcessiveBlinking(landmarks, timestamp),
       headShaking: this.detectHeadShaking(landmarks),
       nervousExpressions: this.detectNervousExpressions(expressions),
-      fidgeting: this.detectFidgeting(landmarks)
+      fidgeting: this.detectFidgeting(landmarks),
+      lipBiting: this.detectLipBiting(landmarks)
     };
 
     // Count total tics
@@ -462,7 +498,7 @@ class FacialAnalyzer {
       totalCount: totalTics,
       severity: severity,
       feedback: feedback,
-      score: Math.max(0, 100 - (totalTics * 25))
+      score: Math.max(0, 100 - (totalTics * 20))
     };
   }
 
@@ -546,23 +582,53 @@ class FacialAnalyzer {
 
   // Detect general fidgeting (simplified)
   detectFidgeting(landmarks) {
-    // This is a simplified version - in a real implementation,
-    // you might track more subtle movements and patterns
     const mouth = landmarks.getMouth();
-    const mouthCenter = this.calculateCenter(mouth);
+    const nose = landmarks.getNose();
+    const center = {
+      x: (mouth[0].x + mouth[6].x + nose[0].x) / 3,
+      y: (mouth[0].y + mouth[6].y + nose[0].y) / 3
+    };
 
-    // Track small mouth movements that might indicate nervous habits
-    let isFidgeting = false;
-    if (this.previousLandmarks) {
-      const prevMouth = this.calculateCenter(this.previousLandmarks.getMouth());
-      const mouthMovement = Math.abs(mouthCenter.y - prevMouth.y);
-      isFidgeting = mouthMovement > 2; // Small threshold for subtle movements
-    }
+    if (!this.fidgetHistory) this.fidgetHistory = [];
+    this.fidgetHistory.push(center);
+    if (this.fidgetHistory.length > 30) this.fidgetHistory.shift();
+    if (this.fidgetHistory.length < 30) return { detected: false, level: 0 };
 
+    const avgX = this.fidgetHistory.reduce((sum, h) => sum + h.x, 0) / this.fidgetHistory.length;
+    const avgY = this.fidgetHistory.reduce((sum, h) => sum + h.y, 0) / this.fidgetHistory.length;
+
+    // Calculate variance
+    const varianceX = this.fidgetHistory.reduce((sum, h) => sum + Math.pow(h.x - avgX, 2), 0) / this.fidgetHistory.length;
+    const varianceY = this.fidgetHistory.reduce((sum, h) => sum + Math.pow(h.y - avgY, 2), 0) / this.fidgetHistory.length;
+    const variance = varianceX + varianceY;
+    
+    // Fidgeting if variance is high (constant small movements)
+    // Increased from 200 to 1200 to avoid triggering on normal head movements
+    const isFidgeting = variance > 1200;
+    
     return {
       detected: isFidgeting,
-      type: 'mouth_movement',
-      intensity: 'low'
+      level: Math.min(100, Math.round((variance / 1200) * 100))
+    };
+  }
+
+  // Detect lip biting (heuristic)
+  detectLipBiting(landmarks) {
+    const mouth = landmarks.getMouth();
+    // Inner mouth points for face-api.js: 
+    // Upper lip inner bottom: 62, Lower lip inner top: 66
+    // Since getMouth returns an array of 20 points, the inner lip starts at index 12.
+    // Index 14 is upper inner lip bottom, index 18 is lower inner lip top.
+    const upperLipBottom = mouth[14].y;
+    const lowerLipTop = mouth[18].y;
+    
+    // Normal closed mouth has upperLipBottom <= lowerLipTop.
+    // If lowerLipTop < upperLipBottom by a significant margin, lips might be folded inwards.
+    const isBiting = (upperLipBottom - lowerLipTop) > 3;
+    
+    return {
+      detected: isBiting,
+      level: isBiting ? 100 : 0
     };
   }
 
@@ -587,9 +653,9 @@ class FacialAnalyzer {
 
   // Calculate overall engagement score
   calculateOverallEngagement(smileAnalysis, eyeContactAnalysis, nervousTicsAnalysis) {
-    const smileScore = smileAnalysis.score * 0.3;
-    const eyeContactScore = eyeContactAnalysis.score * 0.4;
-    const nervousScore = nervousTicsAnalysis.score * 0.3;
+    const smileScore = smileAnalysis.score * 0.3; // 30% weight
+    const eyeContactScore = eyeContactAnalysis.score * 0.45; // 45% weight
+    const nervousScore = nervousTicsAnalysis.score * 0.25; // 25% weight (higher means LESS nervous)
 
     const totalScore = Math.round(smileScore + eyeContactScore + nervousScore);
     
@@ -655,6 +721,7 @@ class FacialAnalyzer {
     this.smileHistory = [];
     this.faceBoxHistory = [];
     this.positionHistory = [];
+    this.fidgetHistory = [];
     this.nervousTics = {
       eyeBlinking: 0,
       headShaking: 0,
@@ -665,6 +732,7 @@ class FacialAnalyzer {
     this.lastBlinkTime = 0;
     this.postureBaseline = null;
     this.postureEma = null;
+    this.speechError = false;
   }
 }
 
