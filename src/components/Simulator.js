@@ -59,15 +59,17 @@ const Simulator = ({ onEndSimulation }) => {
   useEffect(() => {
     const loadModels = async () => {
       try {
-        const MODEL_URL = '/models';
-
-        // Load models from CDN if local models are not available
-        await Promise.all([
+        const loadTask = Promise.all([
           faceapi.nets.tinyFaceDetector.loadFromUri('https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights'),
           faceapi.nets.faceLandmark68Net.loadFromUri('https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights'),
           faceapi.nets.faceRecognitionNet.loadFromUri('https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights'),
           faceapi.nets.faceExpressionNet.loadFromUri('https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights')
         ]);
+        
+        // Add a 5 second timeout so it doesn't hang forever
+        const timeoutTask = new Promise((_, reject) => setTimeout(() => reject(new Error('Model load timeout')), 5000));
+        
+        await Promise.race([loadTask, timeoutTask]);
 
         // Initialize analyzers
         await sentimentAnalyzer.initialize();
