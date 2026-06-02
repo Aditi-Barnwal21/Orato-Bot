@@ -231,10 +231,9 @@ For support, questions, or feedback:
 - Create an issue in the repository
 - Check the documentation
 - Review the FAQ section
-
----
-
+  
 **Happy Speaking! 🎤** 
 
+---
 ## ✍️ Author
 ### Aditi Barnwal
